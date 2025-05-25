@@ -1,0 +1,274 @@
+name: Main Branch CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  GATEWAY_IMAGE_NAME: ${{ format('{0}/{1}/gateway-api', 'ghcr.io', github.repository_owner) }}
+  EMAIL_IMAGE_NAME: ${{ format('{0}/{1}/email-service', 'ghcr.io', github.repository_owner) }}
+  AUTH_IMAGE_NAME: ${{ format('{0}/{1}/auth-service', 'ghcr.io', github.repository_owner) }}
+
+jobs:
+  build-and-deploy:
+    if: github.event.pull_request.merged == true || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Set up Docker image names
+        run: |
+          echo "GATEWAY_IMAGE_NAME_LOWER=$(echo ${{ env.REGISTRY }}/${{ github.repository }}/gateway-api | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "EMAIL_IMAGE_NAME_LOWER=$(echo ${{ env.REGISTRY }}/${{ github.repository }}/email-service | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "AUTH_IMAGE_NAME_LOWER=$(echo ${{ env.REGISTRY }}/${{ github.repository }}/auth-service | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and test Gateway API
+        run: |
+          dotnet restore GatewayAPI/GatewayAPI.csproj
+          dotnet build GatewayAPI/GatewayAPI.csproj --configuration Release
+          # Add tests if you have them
+          # dotnet test GatewayAPI.Tests/GatewayAPI.Tests.csproj
+
+      - name: Build and test Email Service
+        run: |
+          dotnet restore EmailService/EmailService.csproj
+          dotnet build EmailService/EmailService.csproj --configuration Release
+          # Add tests if you have them
+          # dotnet test EmailService.Tests/EmailService.Tests.csproj
+
+      - name: Build and test Auth Service
+        run: |
+          dotnet restore AuthenticationService/AuthenticationService.csproj
+          dotnet build AuthenticationService/AuthenticationService.csproj --configuration Release
+          # Add tests if you have them
+          # dotnet test AuthService.Tests/AuthService.Tests.csproj
+
+      - name: Build and push Docker images
+        run: |
+          # Build and push Gateway API
+          docker build -t ${{ env.GATEWAY_IMAGE_NAME_LOWER }}:${{ github.sha }} -t ${{ env.GATEWAY_IMAGE_NAME_LOWER }}:latest ./GatewayAPI
+          docker push ${{ env.GATEWAY_IMAGE_NAME_LOWER }}:${{ github.sha }}
+          docker push ${{ env.GATEWAY_IMAGE_NAME_LOWER }}:latest
+
+          # Build and push Email Service
+          docker build -t ${{ env.EMAIL_IMAGE_NAME_LOWER }}:${{ github.sha }} -t ${{ env.EMAIL_IMAGE_NAME_LOWER }}:latest ./EmailService
+          docker push ${{ env.EMAIL_IMAGE_NAME_LOWER }}:${{ github.sha }}
+          docker push ${{ env.EMAIL_IMAGE_NAME_LOWER }}:latest
+
+          # Build and push Auth Service
+          docker build -t ${{ env.AUTH_IMAGE_NAME_LOWER }}:${{ github.sha }} -t ${{ env.AUTH_IMAGE_NAME_LOWER }}:latest ./AuthenticationService
+          docker push ${{ env.AUTH_IMAGE_NAME_LOWER }}:${{ github.sha }}
+          docker push ${{ env.AUTH_IMAGE_NAME_LOWER }}:latest
+
+      - name: Deploy to Digital Ocean
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.DIGITALOCEAN_HOST }}
+          username: ${{ secrets.DIGITALOCEAN_USERNAME }}
+          password: ${{ secrets.DIGITALOCEAN_PASSWORD }}
+          script: |
+            # Create deployment directory
+            mkdir -p /deployments/microservices
+            cd /deployments/microservices
+            
+            # Login to GitHub Container Registry
+            echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            
+            # Stop and remove existing microservice containers only
+            echo "Stopping existing microservice containers..."
+            docker stop auth-service email-service gateway-api 2>/dev/null || true
+            docker rm auth-service email-service gateway-api 2>/dev/null || true
+            
+            # Remove old microservice images to ensure fresh deployment
+            echo "Removing old microservice images..."
+            docker rmi ${{ env.GATEWAY_IMAGE_NAME_LOWER }}:latest 2>/dev/null || echo "Gateway image not found"
+            docker rmi ${{ env.EMAIL_IMAGE_NAME_LOWER }}:latest 2>/dev/null || echo "Email image not found"
+            docker rmi ${{ env.AUTH_IMAGE_NAME_LOWER }}:latest 2>/dev/null || echo "Auth image not found"
+            
+            # Pull latest images
+            echo "Pulling latest images..."
+            docker pull ${{ env.GATEWAY_IMAGE_NAME_LOWER }}:latest
+            docker pull ${{ env.EMAIL_IMAGE_NAME_LOWER }}:latest
+            docker pull ${{ env.AUTH_IMAGE_NAME_LOWER }}:latest
+            
+            # Create docker network
+            docker network create microservices-network 2>/dev/null || echo "Network already exists"
+            
+            # Start SQL Server if not running
+            if ! docker ps | grep -q sqlserver-microservices; then
+                echo "Starting SQL Server..."
+                docker run -d \
+                  --name sqlserver-microservices \
+                  --network microservices-network \
+                  -p 1433:1433 \
+                  -e ACCEPT_EULA=Y \
+                  -e SA_PASSWORD=YourStrong@Passw0rd \
+                  -e MSSQL_PID=Express \
+                  -v sqlserver_data:/var/opt/mssql \
+                  --restart unless-stopped \
+                  mcr.microsoft.com/mssql/server:2022-latest
+                echo "Waiting for SQL Server to start..."
+                sleep 15
+            else
+                echo "SQL Server already running"
+                # Ensure SQL Server is connected to network
+                docker network connect microservices-network sqlserver-microservices 2>/dev/null || echo "SQL Server already on network"
+            fi
+            
+            # Start Kafka if not running
+            if ! docker ps | grep -q kafka-microservices; then
+                echo "Starting Kafka with fixed configuration..."
+                docker run -d \
+                  --name kafka-microservices \
+                  --network microservices-network \
+                  -p 9092:9092 \
+                  -e KAFKA_NODE_ID=1 \
+                  -e KAFKA_PROCESS_ROLES=broker,controller \
+                  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:29093 \
+                  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+                  -e KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093 \
+                  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka-microservices:9092 \
+                  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT \
+                  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+                  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+                  -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+                  -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+                  -e CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk \
+                  --restart unless-stopped \
+                  confluentinc/cp-kafka:latest
+                echo "Waiting for Kafka to start..."
+                sleep 45
+            else
+                echo "Kafka already running"
+                # Ensure Kafka is connected to network
+                docker network connect microservices-network kafka-microservices 2>/dev/null || echo "Kafka already on network"
+            fi
+            
+            # Add all containers to network to ensure connectivity
+            echo "Ensuring all containers are on microservices network..."
+            docker network connect microservices-network sqlserver-microservices 2>/dev/null || echo "SQL Server already on network"
+            docker network connect microservices-network kafka-microservices 2>/dev/null || echo "Kafka already on network"
+            
+            # Start Auth Service
+            echo "Starting Auth Service..."
+            docker run -d \
+              --name auth-service \
+              --network microservices-network \
+              -p 5001:80 \
+              -e ASPNETCORE_ENVIRONMENT=Production \
+              -e ENABLE_SWAGGER=true \
+              -e "ConnectionStrings__DefaultConnection=Server=sqlserver-microservices,1433;Database=AuthDB;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=true" \
+              -e Kafka__BootstrapServers=kafka-microservices:9092 \
+              --restart unless-stopped \
+              ${{ env.AUTH_IMAGE_NAME_LOWER }}:latest
+            
+            # Start Email Service
+            echo "Starting Email Service..."
+            docker run -d \
+              --name email-service \
+              --network microservices-network \
+              -p 5002:80 \
+              -e ASPNETCORE_ENVIRONMENT=Production \
+              -e Kafka__BootstrapServers=kafka-microservices:9092 \
+              --restart unless-stopped \
+              ${{ env.EMAIL_IMAGE_NAME_LOWER }}:latest
+            
+            # Start Gateway API
+            echo "Starting Gateway API..."
+            docker run -d \
+              --name gateway-api \
+              --network microservices-network \
+              -p 5000:80 \
+              -e ASPNETCORE_ENVIRONMENT=Production \
+              -e Services__AuthService=http://auth-service:80 \
+              -e Services__EmailService=http://email-service:80 \
+              --restart unless-stopped \
+              ${{ env.GATEWAY_IMAGE_NAME_LOWER }}:latest
+            
+            # Wait for services to fully start
+            echo "Waiting for services to start..."
+            sleep 45
+            
+            # Ensure all microservices are on the network after startup
+            echo "Final network connectivity check..."
+            docker network connect microservices-network auth-service 2>/dev/null || echo "Auth Service already on network"
+            docker network connect microservices-network email-service 2>/dev/null || echo "Email Service already on network"
+            docker network connect microservices-network gateway-api 2>/dev/null || echo "Gateway API already on network"
+            
+            # Wait for Kafka to be ready before creating topics
+            echo "Waiting for Kafka to be fully ready..."
+            sleep 15
+            
+            # Check container status
+            echo "=== Container Status ==="
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+            echo ""
+            
+            # Create Kafka topic if needed
+            echo "Creating Kafka topic..."
+            docker exec kafka-microservices kafka-topics --create --topic user-registered --bootstrap-server localhost:9092 --replication-factor 1 --partitions 1 --if-not-exists 2>/dev/null || echo "Topic creation skipped"
+            
+            # Verify topic was created
+            echo "Verifying Kafka topic exists..."
+            docker exec kafka-microservices kafka-topics --list --bootstrap-server localhost:9092 2>/dev/null | grep user-registered && echo "Topic verified" || echo "Topic verification failed"
+            
+            # Check health status
+            echo "=== Health Check Results ==="
+            echo "Gateway API Health:"
+            curl -s http://localhost:5000/health && echo " - OK" || echo " - FAILED"
+            echo "Auth Service Health:"
+            curl -s http://localhost:5001/health && echo " - OK" || echo " - FAILED"
+            echo "Email Service Health:"
+            curl -s http://localhost:5002/health && echo " - OK" || echo " - FAILED"
+            
+            # Test Swagger endpoints
+            echo "=== Swagger Check Results ==="
+            echo "Auth Service Swagger JSON:"
+            curl -s http://localhost:5001/swagger/v1/swagger.json | head -1 && echo " - Swagger JSON OK" || echo " - Swagger JSON FAILED"
+            echo "Auth Service API Ping:"
+            curl -s http://localhost:5001/api/auth/ping && echo " - API OK" || echo " - API FAILED"
+            
+            # Show recent logs
+            echo "=== Recent Logs ==="
+            echo "Auth Service logs:"
+            docker logs auth-service --tail=5 2>/dev/null || echo "No logs available"
+            echo "Email Service logs:"
+            docker logs email-service --tail=5 2>/dev/null || echo "No logs available"
+            echo "Gateway API logs:"
+            docker logs gateway-api --tail=5 2>/dev/null || echo "No logs available"
+            
+            echo "=== DEPLOYMENT COMPLETE ===" 
+            echo "=== ACCESS URLS ==="
+            echo "Gateway API: http://159.223.68.114:5000"
+            echo "Auth Service: http://159.223.68.114:5001"
+            echo "Auth Service Swagger: http://159.223.68.114:5001/swagger"
+            echo "Email Service: http://159.223.68.114:5002"
+            echo "=== Swagger UI Available at: http://159.223.68.114:5001/swagger ==="
+            
+            # Cleanup unused Docker images to free up space
+            echo "=== Cleaning up unused Docker images ==="
+            docker image prune -f || echo "No unused images to remove"
+            docker system df || echo "Unable to show disk usage" 

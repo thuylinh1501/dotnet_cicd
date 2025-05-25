@@ -1,0 +1,246 @@
+name: Manual Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Choose deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+        - production
+        - staging
+
+env:
+  REGISTRY: ghcr.io
+  GATEWAY_IMAGE_NAME: ${{ format('{0}/{1}/gateway-api', 'ghcr.io', github.repository_owner) }}
+  EMAIL_IMAGE_NAME: ${{ format('{0}/{1}/email-service', 'ghcr.io', github.repository_owner) }}
+  AUTH_IMAGE_NAME: ${{ format('{0}/{1}/auth-service', 'ghcr.io', github.repository_owner) }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker image names
+        run: |
+          echo "GATEWAY_IMAGE_NAME_LOWER=$(echo ${{ env.REGISTRY }}/${{ github.repository }}/gateway-api | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "EMAIL_IMAGE_NAME_LOWER=$(echo ${{ env.REGISTRY }}/${{ github.repository }}/email-service | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "AUTH_IMAGE_NAME_LOWER=$(echo ${{ env.REGISTRY }}/${{ github.repository }}/auth-service | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Set environment variables
+        run: |
+          if [ "${{ github.event.inputs.environment }}" = "staging" ]; then
+            echo "GATEWAY_PORT=6000" >> $GITHUB_ENV
+            echo "AUTH_PORT=6001" >> $GITHUB_ENV
+            echo "EMAIL_PORT=6002" >> $GITHUB_ENV
+            echo "SQL_PORT=1434" >> $GITHUB_ENV
+            echo "KAFKA_PORT=9093" >> $GITHUB_ENV
+            echo "CONTAINER_SUFFIX=-staging" >> $GITHUB_ENV
+            echo "NETWORK_NAME=microservices-network-staging" >> $GITHUB_ENV
+          else
+            echo "GATEWAY_PORT=5000" >> $GITHUB_ENV
+            echo "AUTH_PORT=5001" >> $GITHUB_ENV
+            echo "EMAIL_PORT=5002" >> $GITHUB_ENV
+            echo "SQL_PORT=1433" >> $GITHUB_ENV
+            echo "KAFKA_PORT=9092" >> $GITHUB_ENV
+            echo "CONTAINER_SUFFIX=" >> $GITHUB_ENV
+            echo "NETWORK_NAME=microservices-network" >> $GITHUB_ENV
+          fi
+
+      - name: Deploy to ${{ github.event.inputs.environment }}
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.DIGITALOCEAN_HOST }}
+          username: ${{ secrets.DIGITALOCEAN_USERNAME }}
+          password: ${{ secrets.DIGITALOCEAN_PASSWORD }}
+          script: |
+            # Create deployment directory
+            mkdir -p /deployments/microservices
+            cd /deployments/microservices
+            
+            # Login to GitHub Container Registry
+            echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            
+            # Stop and remove existing microservice containers for this environment
+            echo "Stopping existing ${{ github.event.inputs.environment }} microservice containers..."
+            docker stop auth-service${{ env.CONTAINER_SUFFIX }} email-service${{ env.CONTAINER_SUFFIX }} gateway-api${{ env.CONTAINER_SUFFIX }} 2>/dev/null || true
+            docker rm auth-service${{ env.CONTAINER_SUFFIX }} email-service${{ env.CONTAINER_SUFFIX }} gateway-api${{ env.CONTAINER_SUFFIX }} 2>/dev/null || true
+            
+            # Remove old microservice images to ensure fresh deployment
+            echo "Removing old microservice images for ${{ github.event.inputs.environment }}..."
+            docker rmi ${{ env.GATEWAY_IMAGE_NAME_LOWER }}:latest 2>/dev/null || echo "Gateway image not found"
+            docker rmi ${{ env.EMAIL_IMAGE_NAME_LOWER }}:latest 2>/dev/null || echo "Email image not found"
+            docker rmi ${{ env.AUTH_IMAGE_NAME_LOWER }}:latest 2>/dev/null || echo "Auth image not found"
+            
+            # Pull latest images
+            echo "Pulling latest images for ${{ github.event.inputs.environment }}..."
+            docker pull ${{ env.GATEWAY_IMAGE_NAME_LOWER }}:latest
+            docker pull ${{ env.EMAIL_IMAGE_NAME_LOWER }}:latest
+            docker pull ${{ env.AUTH_IMAGE_NAME_LOWER }}:latest
+            
+            # Create docker network
+            docker network create ${{ env.NETWORK_NAME }} 2>/dev/null || echo "Network already exists"
+            
+            # Start SQL Server if not running for this environment
+            if ! docker ps | grep -q sqlserver-microservices${{ env.CONTAINER_SUFFIX }}; then
+                echo "Starting SQL Server for ${{ github.event.inputs.environment }}..."
+                docker run -d \
+                  --name sqlserver-microservices${{ env.CONTAINER_SUFFIX }} \
+                  --network ${{ env.NETWORK_NAME }} \
+                  -p ${{ env.SQL_PORT }}:1433 \
+                  -e ACCEPT_EULA=Y \
+                  -e SA_PASSWORD=YourStrong@Passw0rd \
+                  -e MSSQL_PID=Express \
+                  -v sqlserver_data${{ env.CONTAINER_SUFFIX }}:/var/opt/mssql \
+                  --restart unless-stopped \
+                  mcr.microsoft.com/mssql/server:2022-latest
+                echo "Waiting for SQL Server to start..."
+                sleep 15
+            else
+                echo "SQL Server already running for ${{ github.event.inputs.environment }}"
+                # Ensure SQL Server is connected to network
+                docker network connect ${{ env.NETWORK_NAME }} sqlserver-microservices${{ env.CONTAINER_SUFFIX }} 2>/dev/null || echo "SQL Server already on network"
+            fi
+            
+            # Start Kafka if not running for this environment
+            if ! docker ps | grep -q kafka-microservices${{ env.CONTAINER_SUFFIX }}; then
+                echo "Starting Kafka with fixed configuration for ${{ github.event.inputs.environment }}..."
+                docker run -d \
+                  --name kafka-microservices${{ env.CONTAINER_SUFFIX }} \
+                  --network ${{ env.NETWORK_NAME }} \
+                  -p ${{ env.KAFKA_PORT }}:9092 \
+                  -e KAFKA_NODE_ID=1 \
+                  -e KAFKA_PROCESS_ROLES=broker,controller \
+                  -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:29093 \
+                  -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+                  -e KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093 \
+                  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka-microservices${{ env.CONTAINER_SUFFIX }}:9092 \
+                  -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT \
+                  -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+                  -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+                  -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+                  -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+                  -e CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk \
+                  --restart unless-stopped \
+                  confluentinc/cp-kafka:latest
+                echo "Waiting for Kafka to start..."
+                sleep 45
+            else
+                echo "Kafka already running for ${{ github.event.inputs.environment }}"
+                # Ensure Kafka is connected to network
+                docker network connect ${{ env.NETWORK_NAME }} kafka-microservices${{ env.CONTAINER_SUFFIX }} 2>/dev/null || echo "Kafka already on network"
+            fi
+            
+            # Add all containers to network to ensure connectivity
+            echo "Ensuring all containers are on ${{ env.NETWORK_NAME }} network..."
+            docker network connect ${{ env.NETWORK_NAME }} sqlserver-microservices${{ env.CONTAINER_SUFFIX }} 2>/dev/null || echo "SQL Server already on network"
+            docker network connect ${{ env.NETWORK_NAME }} kafka-microservices${{ env.CONTAINER_SUFFIX }} 2>/dev/null || echo "Kafka already on network"
+            
+            # Start Auth Service
+            echo "Starting Auth Service for ${{ github.event.inputs.environment }}..."
+            docker run -d \
+              --name auth-service${{ env.CONTAINER_SUFFIX }} \
+              --network ${{ env.NETWORK_NAME }} \
+              -p ${{ env.AUTH_PORT }}:80 \
+              -e ASPNETCORE_ENVIRONMENT=Production \
+              -e ENABLE_SWAGGER=true \
+              -e "ConnectionStrings__DefaultConnection=Server=sqlserver-microservices${{ env.CONTAINER_SUFFIX }},1433;Database=AuthDB;User Id=sa;Password=YourStrong@Passw0rd;TrustServerCertificate=true" \
+              -e Kafka__BootstrapServers=kafka-microservices${{ env.CONTAINER_SUFFIX }}:9092 \
+              --restart unless-stopped \
+              ${{ env.AUTH_IMAGE_NAME_LOWER }}:latest
+            
+            # Start Email Service
+            echo "Starting Email Service for ${{ github.event.inputs.environment }}..."
+            docker run -d \
+              --name email-service${{ env.CONTAINER_SUFFIX }} \
+              --network ${{ env.NETWORK_NAME }} \
+              -p ${{ env.EMAIL_PORT }}:80 \
+              -e ASPNETCORE_ENVIRONMENT=Production \
+              -e Kafka__BootstrapServers=kafka-microservices${{ env.CONTAINER_SUFFIX }}:9092 \
+              --restart unless-stopped \
+              ${{ env.EMAIL_IMAGE_NAME_LOWER }}:latest
+            
+            # Start Gateway API
+            echo "Starting Gateway API for ${{ github.event.inputs.environment }}..."
+            docker run -d \
+              --name gateway-api${{ env.CONTAINER_SUFFIX }} \
+              --network ${{ env.NETWORK_NAME }} \
+              -p ${{ env.GATEWAY_PORT }}:80 \
+              -e ASPNETCORE_ENVIRONMENT=Production \
+              -e Services__AuthService=http://auth-service${{ env.CONTAINER_SUFFIX }}:80 \
+              -e Services__EmailService=http://email-service${{ env.CONTAINER_SUFFIX }}:80 \
+              --restart unless-stopped \
+              ${{ env.GATEWAY_IMAGE_NAME_LOWER }}:latest
+            
+            # Wait for services to fully start
+            echo "Waiting for services to start..."
+            sleep 45
+            
+            # Ensure all microservices are on the network after startup
+            echo "Final network connectivity check for ${{ github.event.inputs.environment }}..."
+            docker network connect ${{ env.NETWORK_NAME }} auth-service${{ env.CONTAINER_SUFFIX }} 2>/dev/null || echo "Auth Service already on network"
+            docker network connect ${{ env.NETWORK_NAME }} email-service${{ env.CONTAINER_SUFFIX }} 2>/dev/null || echo "Email Service already on network"
+            docker network connect ${{ env.NETWORK_NAME }} gateway-api${{ env.CONTAINER_SUFFIX }} 2>/dev/null || echo "Gateway API already on network"
+            
+            # Wait for Kafka to be ready before creating topics
+            echo "Waiting for Kafka to be fully ready..."
+            sleep 15
+            
+            # Check container status
+            echo "=== Container Status for ${{ github.event.inputs.environment }} ==="
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep "${{ env.CONTAINER_SUFFIX }}\|NAMES"
+            echo ""
+            
+            # Create Kafka topic if needed
+            echo "Creating Kafka topic..."
+            docker exec kafka-microservices${{ env.CONTAINER_SUFFIX }} kafka-topics --create --topic user-registered --bootstrap-server localhost:9092 --replication-factor 1 --partitions 1 --if-not-exists 2>/dev/null || echo "Topic creation skipped"
+            
+            # Verify topic was created
+            echo "Verifying Kafka topic exists..."
+            docker exec kafka-microservices${{ env.CONTAINER_SUFFIX }} kafka-topics --list --bootstrap-server localhost:9092 2>/dev/null | grep user-registered && echo "Topic verified" || echo "Topic verification failed"
+            
+            # Check health status
+            echo "=== Health Check Results for ${{ github.event.inputs.environment }} ==="
+            echo "Gateway API Health (port ${{ env.GATEWAY_PORT }}):"
+            curl -s http://localhost:${{ env.GATEWAY_PORT }}/health && echo " - OK" || echo " - FAILED"
+            echo "Auth Service Health (port ${{ env.AUTH_PORT }}):"
+            curl -s http://localhost:${{ env.AUTH_PORT }}/health && echo " - OK" || echo " - FAILED"
+            echo "Email Service Health (port ${{ env.EMAIL_PORT }}):"
+            curl -s http://localhost:${{ env.EMAIL_PORT }}/health && echo " - OK" || echo " - FAILED"
+            
+            # Test Swagger endpoints for Auth Service
+            echo "=== Swagger Check Results for ${{ github.event.inputs.environment }} ==="
+            echo "Auth Service Swagger JSON (port ${{ env.AUTH_PORT }}):"
+            curl -s http://localhost:${{ env.AUTH_PORT }}/swagger/v1/swagger.json | head -1 && echo " - Swagger JSON OK" || echo " - Swagger JSON FAILED"
+            echo "Auth Service API Ping (port ${{ env.AUTH_PORT }}):"
+            curl -s http://localhost:${{ env.AUTH_PORT }}/api/auth/ping && echo " - API OK" || echo " - API FAILED"
+            
+            # Show recent logs
+            echo "=== Recent Logs for ${{ github.event.inputs.environment }} ==="
+            echo "Auth Service logs:"
+            docker logs auth-service${{ env.CONTAINER_SUFFIX }} --tail=5 2>/dev/null || echo "No logs available"
+            echo "Email Service logs:"
+            docker logs email-service${{ env.CONTAINER_SUFFIX }} --tail=5 2>/dev/null || echo "No logs available"
+            echo "Gateway API logs:"
+            docker logs gateway-api${{ env.CONTAINER_SUFFIX }} --tail=5 2>/dev/null || echo "No logs available"
+            
+            echo "=== DEPLOYMENT TO ${{ github.event.inputs.environment }} COMPLETE ==="
+            echo "=== ACCESS URLS ==="
+            echo "Gateway API: http://159.223.68.114:${{ env.GATEWAY_PORT }}"
+            echo "Auth Service: http://159.223.68.114:${{ env.AUTH_PORT }}"
+            echo "Auth Service Swagger: http://159.223.68.114:${{ env.AUTH_PORT }}/swagger"
+            echo "Email Service: http://159.223.68.114:${{ env.EMAIL_PORT }}"
+            echo "=== Swagger UI Available at: http://159.223.68.114:${{ env.AUTH_PORT }}/swagger ==="
+            
+            # Cleanup unused Docker images to free up space
+            echo "=== Cleaning up unused Docker images ==="
+            docker image prune -f || echo "No unused images to remove"
+            docker system df || echo "Unable to show disk usage" 
